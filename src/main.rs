@@ -1,6 +1,6 @@
 use std::{error::Error, fs::File};
 
-use autoencoder::{AutoEncoder, Device, MLP};
+use autoencoder::{AutoEncoder, Device, MLPConfig};
 
 use dfdx::{
     shapes::{Const, Rank1},
@@ -13,9 +13,9 @@ fn main() {
     let dev: Device = Device::default();
 
     // Define architecture
-    let mut ae: AutoEncoder<784, 15> = AutoEncoder::new(
-        MLP::new(183, 48),
-        MLP::new(48, 183)
+    let mut ae: AutoEncoder<784, 10> = AutoEncoder::new(
+        MLPConfig::new(183, 48),
+        MLPConfig::new(48, 183)
     );
 
     // Initialise data
@@ -24,7 +24,8 @@ fn main() {
         dev.tensor((read_mnist().ok().unwrap(), (10000, Const)));
 
     // Fit model
-    ae.fit(x, 850, 5.0e-4);
+    //ae.fit(x, 50, 6.0e-4);
+    ae.load("params/");
 
     let x: Tensor<Rank1<784>, f32, _> = dev.sample_normal();
     let y = ae.encode(x).unwrap();
