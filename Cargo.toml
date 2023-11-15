@@ -13,6 +13,7 @@ dfdx-core = {git = "https://github.com/coreylowman/dfdx" }
 serde = "1.0.192"
 csv = "1.3.0"
 safetensors = "0.4.0"
+memmap2 = "0.9.0"
 
 [features]
 default = ["cuda"]

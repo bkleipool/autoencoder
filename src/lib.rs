@@ -1,23 +1,25 @@
+use std::path::Path;
+
 use dfdx::{
     prelude::{Adam, LinearConfig, Tanh},
     shapes::Const,
     tensor::{Error, Tensor},
 };
 use dfdx_core::{
-    nn_traits::{BuildModuleExt, Module, Optimizer, ZeroGrads, SaveSafeTensors, LoadSafeTensors},
+    nn_traits::{BuildModuleExt, LoadSafeTensors, Module, Optimizer, SaveSafeTensors, ZeroGrads},
     prelude::mse_loss,
     shapes::Rank1,
     tensor::{AsArray, Trace},
     tensor_ops::{AdamConfig, Backward},
 };
 use dfdx_derives::Sequential;
+use safetensors::{tensor::TensorView, SafeTensorError};
 
 #[cfg(not(feature = "cuda"))]
 pub type Device = dfdx::tensor::Cpu;
 
 #[cfg(feature = "cuda")]
 pub type Device = dfdx::tensor::Cuda;
-
 
 /// Autoencoder consisting of an encoder and decoder network
 ///
@@ -39,6 +41,7 @@ pub struct MLPConfig<const I: usize, const O: usize> {
     linear2: LinearConfig<usize, usize>,
     act2: Tanh,
     linear3: LinearConfig<usize, Const<O>>,
+    act3: Tanh,
 }
 
 impl<const I: usize, const O: usize> MLPConfig<I, O> {
@@ -49,23 +52,47 @@ impl<const I: usize, const O: usize> MLPConfig<I, O> {
             linear2: LinearConfig::new(l1, l2),
             act2: Default::default(),
             linear3: LinearConfig::new(l2, Const),
+            act3: Default::default(),
         }
     }
 }
 
 impl<const I: usize, const O: usize> MLP<I, O, f32, Device> {
-    /// Save the MLP parameters to a folder of `.safetensor` files 
-    pub fn save_safetensors(&self, path: &str, id: &str) {
-        self.linear1.save_safetensors(path.to_owned()+id+"_linear1.safetensors").expect("Linear1 failed to save");
-        self.linear2.save_safetensors(path.to_owned()+id+"_linear2.safetensors").expect("Linear2 failed to save");
-        self.linear3.save_safetensors(path.to_owned()+id+"_linear3.safetensors").expect("Linear3 failed to save");
+    /// Save the MLP parameters to a folder of `.safetensor` files
+    pub fn save_safetensors<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+    ) -> Result<(), SafeTensorError> {
+        let mut tensors = Vec::new();
+
+        self.linear1.write_safetensors("linear1", &mut tensors);
+        self.linear2.write_safetensors("linear2", &mut tensors);
+        self.linear3.write_safetensors("linear3", &mut tensors);
+
+        let data = tensors.iter().map(|(k, dtype, shape, data)| {
+            (
+                k.clone(),
+                TensorView::new(*dtype, shape.clone(), data).unwrap(),
+            )
+        });
+
+        safetensors::serialize_to_file(data, &None, path.as_ref())
     }
 
-    /// Load the MLP parameters from a folder of `.safetensor` files 
-    pub fn load_safetensors(&mut self, path: &str, id: &str) {
-        self.linear1.load_safetensors(path.to_owned()+id+"_linear1.safetensors").expect("Linear1 failed to load");
-        self.linear2.load_safetensors(path.to_owned()+id+"_linear2.safetensors").expect("Linear2 failed to load");
-        self.linear3.load_safetensors(path.to_owned()+id+"_linear3.safetensors").expect("Linear3 failed to load");
+    /// Load the MLP parameters from a folder of `.safetensor` files
+    pub fn load_safetensors<P: AsRef<std::path::Path>>(
+        &mut self,
+        path: P,
+    ) -> Result<(), SafeTensorError> {
+        let f = std::fs::File::open(path)?;
+        let buffer = unsafe { memmap2::MmapOptions::new().map(&f)? };
+        let tensors = safetensors::SafeTensors::deserialize(&buffer)?;
+
+        self.linear1.read_safetensors("linear1", &tensors)?;
+        self.linear2.read_safetensors("linear2", &tensors)?;
+        self.linear3.read_safetensors("linear3", &tensors)?;
+
+        Ok(())
     }
 }
 
@@ -90,8 +117,6 @@ impl<const R: usize, const L: usize> AutoEncoder<R, L> {
             let arch = (self.encoder.clone(), self.decoder.clone());
             dev.build_module::<f32>(arch)
         };
-        //let arch = (self.encoder.clone(), self.decoder.clone()); //let arch = self.encoder.clone();
-        //let mut model = dev.build_module::<f32>(arch);
         let mut grads = model.alloc_grads();
 
         // Initialise optimiser
@@ -99,17 +124,16 @@ impl<const R: usize, const L: usize> AutoEncoder<R, L> {
             &model,
             AdamConfig {
                 lr,
+                weight_decay: None,
                 ..Default::default()
             },
         );
-
-        //let y: Tensor<(usize, Const<L>), f32, _> = dev.sample_normal_like(&(10_000, Const));
 
         // Optimisation loop
         for i in 0..epochs {
             // Collect the gradients of the network
             let prediction = model.forward_mut(x.trace(grads));
-            let loss = mse_loss(prediction, x.clone()); //let loss = mse_loss(prediction, y.clone());
+            let loss = mse_loss(prediction, x.clone());
             println!("Loss after update {i}: {:?}", loss.array());
             grads = loss.backward();
 
@@ -119,9 +143,6 @@ impl<const R: usize, const L: usize> AutoEncoder<R, L> {
 
             model.zero_grads(&mut grads);
         }
-
-        // save model parameters (broken)
-        //model.save_safetensors("checkpoint.npz").expect("oopsie");
 
         self.model = Some(model)
     }
@@ -148,33 +169,48 @@ impl<const R: usize, const L: usize> AutoEncoder<R, L> {
         }
     }
 
-    /// Save the model parameters to a folder of `.safetensor` files 
-    pub fn save(&self, path: &str) {
-        self.model.as_ref().expect("Encoder model not found").0.save_safetensors(path,"encoder");
-        self.model.as_ref().expect("Decoder model not found").1.save_safetensors(path,"decoder");
+    /// Save the model parameters to a pair of `.safetensor` files
+    pub fn save(&self, path: &Path, model_name: &str) -> Result<(), SafeTensorError> {
+        let mut p_encoder = path.to_path_buf();
+        let mut p_decoder = path.to_path_buf();
+        p_encoder.push(model_name.to_owned() + "_encoder.safetensors");
+        p_decoder.push(model_name.to_owned() + "_decoder.safetensors");
 
-        //model.0.save_safetensors("params/","encoder");
-        //model.1.save_safetensors("params/","decoder");
-        //self.model.unwrap().0.save_safetensors("checkpoint.npz")?;
+        self.model
+            .as_ref()
+            .expect("Encoder model not initialised")
+            .0
+            .save_safetensors(p_encoder)?;
+        self.model
+            .as_ref()
+            .expect("Decoder model not initialised")
+            .1
+            .save_safetensors(p_decoder)?;
+        Ok(())
     }
 
-    /// Load the model parameters from a folder of `.safetensor` files 
-    pub fn load(&mut self, path: &str) {
+    /// Load the model parameters from a pair of `.safetensor` files
+    pub fn load(
+        &mut self,
+        encoder_path: &Path,
+        decoder_path: &Path,
+    ) -> Result<(), SafeTensorError> {
         match self.model.as_mut() {
             Some(m) => {
-                m.0.load_safetensors(path, "encoder");
-                m.1.load_safetensors(path, "decoder");
-            },
+                m.0.load_safetensors(encoder_path)?;
+                m.1.load_safetensors(decoder_path)?;
+            }
             None => {
                 let dev: Device = Device::default();
                 let arch = (self.encoder.clone(), self.decoder.clone());
                 let mut m = dev.build_module::<f32>(arch);
 
-                m.0.load_safetensors(path, "encoder");
-                m.1.load_safetensors(path, "decoder");
-
+                m.0.load_safetensors(encoder_path)?;
+                m.1.load_safetensors(decoder_path)?;
                 self.model = Some(m);
-            },
+            }
         }
+
+        Ok(())
     }
 }
