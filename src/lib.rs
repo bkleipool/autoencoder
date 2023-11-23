@@ -15,15 +15,17 @@ use dfdx_core::{
 use dfdx_derives::Sequential;
 use safetensors::{tensor::TensorView, SafeTensorError};
 
-#[cfg(not(feature = "cuda"))]
-pub type Device = dfdx::tensor::Cpu;
+//#[cfg(not(feature = "cuda"))]
+//pub type Device = dfdx::tensor::Cpu;
 
-#[cfg(feature = "cuda")]
+//#[cfg(feature = "cuda")]
 pub type Device = dfdx::tensor::Cuda;
+
 
 /// Autoencoder consisting of an encoder and decoder network
 ///
-/// R = real-space vector size, L = latent-space vector size
+/// * R = real-space vector size
+/// * L = latent-space vector size
 pub struct AutoEncoder<const R: usize, const L: usize> {
     encoder: MLPConfig<R, L>,
     decoder: MLPConfig<L, R>,
@@ -32,7 +34,8 @@ pub struct AutoEncoder<const R: usize, const L: usize> {
 
 /// Multi-layer perceptron with 1 hidden layer
 ///
-/// I = input vector size, O = output vector size
+/// * I = input vector size
+/// * O = output vector size
 #[derive(Debug, Clone, Sequential)]
 #[built(MLP)]
 pub struct MLPConfig<const I: usize, const O: usize> {
@@ -105,8 +108,10 @@ impl<const R: usize, const L: usize> AutoEncoder<R, L> {
         }
     }
 
-    /// Fit the model to the input data
-    pub fn fit(&mut self, x: Tensor<(usize, Const<R>), f32, Device>, epochs: usize, lr: f64) {
+    /// Fit the model to the input data for the specified number of epochs
+    /// 
+    /// This function allows for warm-start training and uses the ADAM optimisation loop.
+    pub fn partial_fit(&mut self, x: Tensor<(usize, Const<R>), f32, Device>, epochs: usize, lr: f64) {
         // Initialise device
         let dev: Device = Device::default();
 
@@ -134,7 +139,7 @@ impl<const R: usize, const L: usize> AutoEncoder<R, L> {
             // Collect the gradients of the network
             let prediction = model.forward_mut(x.trace(grads));
             let loss = mse_loss(prediction, x.clone());
-            println!("Loss after update {i}: {:?}", loss.array());
+            println!("Training loss after {i}: {:?}", loss.array());
             grads = loss.backward();
 
             // Update weights
@@ -145,6 +150,15 @@ impl<const R: usize, const L: usize> AutoEncoder<R, L> {
         }
 
         self.model = Some(model)
+    }
+
+    /// Calculate the MSE loss on a set of validation data
+    pub fn calc_validation_loss(&self, x: Tensor<(usize, Const<R>), f32, Device>) -> f32 {
+        let prediction = self.model.as_ref().unwrap().forward(x.clone());
+
+        mse_loss(prediction, x).as_vec()
+            .iter()
+            .fold(0., |acc, i| acc + i)
     }
 
     /// Encode a real-space input vector to latent space
